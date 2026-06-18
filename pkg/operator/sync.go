@@ -45,6 +45,8 @@ const (
 	machineExposeMetricsPort            = 8441
 	machineSetExposeMetricsPort         = 8442
 	machineHealthCheckExposeMetricsPort = 8444
+	machinePprofExposePort              = 6060
+	machinePprofUpstreamPort            = 6061
 	defaultMachineHealthPort            = 9440
 	defaultMachineSetHealthPort         = 9441
 	defaultMachineHealthCheckHealthPort = 9442
@@ -535,7 +537,8 @@ func newPodTemplateSpec(config *OperatorConfig, features map[string]bool) *corev
 
 	containers := newContainers(config, features, tlsArgs)
 	withMHCProxy := config.Controllers.MachineHealthCheck != ""
-	proxyContainers := newKubeProxyContainers(config.Controllers.KubeRBACProxy, withMHCProxy, tlsArgs)
+	withPprofProxy := config.EnablePprof && config.PlatformType == configv1.AWSPlatformType
+	proxyContainers := newKubeProxyContainers(config.Controllers.KubeRBACProxy, withMHCProxy, withPprofProxy, tlsArgs)
 	tolerations := []corev1.Toleration{
 		{
 			Key:    "node-role.kubernetes.io/master",
@@ -697,6 +700,16 @@ func newContainers(config *OperatorConfig, features map[string]bool, tlsArgs []s
 	featureGateArgs := append(args, buildFeatureGatesString(features))
 
 	machineControllerArgs := append([]string{}, featureGateArgs...)
+	// Pprof is currently only supported on AWS, where the machine controller binary
+	// exposes the pprof endpoint (see openshift/machine-api-provider-aws#189).
+	// To enable pprof for other providers, the provider's machine controller must
+	// accept --enable-pprof / --pprof-bind-address flags and serve the pprof handler.
+	if config.EnablePprof && config.PlatformType == configv1.AWSPlatformType {
+		machineControllerArgs = append(machineControllerArgs,
+			"--enable-pprof",
+			fmt.Sprintf("--pprof-bind-address=127.0.0.1:%d", machinePprofUpstreamPort),
+		)
+	}
 	switch config.PlatformType {
 	case configv1.AzurePlatformType, configv1.GCPPlatformType:
 		machineControllerArgs = append(machineControllerArgs, "--max-concurrent-reconciles=10")
@@ -908,7 +921,7 @@ func resolveTLSProfile(tlsProfile configv1.TLSProfileSpec, tlsAdherencePolicy co
 	return *configv1.TLSProfiles[libgocrypto.DefaultTLSProfileType]
 }
 
-func newKubeProxyContainers(image string, withMHCProxy bool, tlsArgs []string) []corev1.Container {
+func newKubeProxyContainers(image string, withMHCProxy, withPprofProxy bool, tlsArgs []string) []corev1.Container {
 	proxyContainers := []corev1.Container{
 		newKubeProxyContainer(image, "machineset-mtrc", metrics.DefaultMachineSetMetricsAddress, machineSetExposeMetricsPort, tlsArgs),
 		newKubeProxyContainer(image, "machine-mtrc", metrics.DefaultMachineMetricsAddress, machineExposeMetricsPort, tlsArgs),
@@ -916,6 +929,11 @@ func newKubeProxyContainers(image string, withMHCProxy bool, tlsArgs []string) [
 	if withMHCProxy {
 		proxyContainers = append(proxyContainers,
 			newKubeProxyContainer(image, "mhc-mtrc", metrics.DefaultHealthCheckMetricsAddress, machineHealthCheckExposeMetricsPort, tlsArgs),
+		)
+	}
+	if withPprofProxy {
+		proxyContainers = append(proxyContainers,
+			newKubeProxyContainer(image, "machine-pprof", fmt.Sprintf(":%d", machinePprofUpstreamPort), machinePprofExposePort, tlsArgs),
 		)
 	}
 	return proxyContainers
